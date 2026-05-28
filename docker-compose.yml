@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -39,6 +37,7 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - PYTHONPATH=/app
       - DATABASE_URL=postgresql+asyncpg://glacis:glacispassword@postgres:5432/glacis_gateway
       - REDIS_URL=redis://redis:6379/0
       - OPENAI_API_KEY=${OPENAI_API_KEY}
@@ -55,8 +54,9 @@ services:
       dockerfile: Dockerfile
     container_name: glacis-worker
     entrypoint: []
-    command: ["arq", "app.workers.tasks.WorkerSettings"]
+    command: ["python", "-m", "arq", "app.workers.tasks.WorkerSettings"]
     environment:
+      - PYTHONPATH=/app
       - DATABASE_URL=postgresql+asyncpg://glacis:glacispassword@postgres:5432/glacis_gateway
       - REDIS_URL=redis://redis:6379/0
       - OPENAI_API_KEY=${OPENAI_API_KEY}

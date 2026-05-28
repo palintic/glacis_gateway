@@ -1,5 +1,4 @@
 import uuid
-from datetime import datetime
 from typing import Any
 
 import structlog
@@ -10,6 +9,7 @@ from app.db.queries import get_raw_event_by_id, get_vendor_schema, insert_invoic
 from app.db.session import AsyncSessionLocal, engine
 from app.services.llm import EntityType, NormalizerService
 from app.services.registry import apply_spec, compute_fingerprint
+from app.utils import parse_event_time
 
 logger = structlog.get_logger(__name__)
 
@@ -77,7 +77,7 @@ async def process_webhook_event(ctx: dict[str, Any], event_id_str: str) -> str:
                     external_id=d.external_id,
                     vendor=d.vendor,
                     state=d.state.value if hasattr(d.state, "value") else d.state,
-                    event_time=datetime.fromisoformat(d.event_time.replace("Z", "+00:00")),
+                    event_time=parse_event_time(d.event_time),
                     raw_payload_id=event.id,
                     container_id=d.container_id,
                 )
@@ -90,7 +90,7 @@ async def process_webhook_event(ctx: dict[str, Any], event_id_str: str) -> str:
                     state=d.state.value if hasattr(d.state, "value") else d.state,
                     currency=d.currency,
                     amount=d.amount,
-                    event_time=datetime.fromisoformat(d.event_time.replace("Z", "+00:00")),
+                    event_time=parse_event_time(d.event_time),
                     raw_payload_id=event.id,
                 )
             elif norm_result.entity_type == EntityType.UNCLASSIFIED:

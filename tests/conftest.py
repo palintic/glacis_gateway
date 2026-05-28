@@ -1,4 +1,3 @@
-import asyncio
 from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,13 +14,6 @@ from app.main import app
 
 # Use real PostgreSQL — tests require `docker compose up postgres -d`
 settings.ENVIRONMENT = "testing"
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest.fixture(scope="session")

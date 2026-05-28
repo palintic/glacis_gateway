@@ -126,6 +126,7 @@ app/
 ├── db/
 │   ├── base.py              # declarative base with audit columns
 │   ├── session.py           # async engine, session factory, get_db
+│   ├── queries.py           # all database queries
 │   ├── models/
 │   │   ├── raw_event.py     # raw payload + status tracking
 │   │   ├── shipment.py      # canonical shipment events (append-only)
@@ -136,12 +137,11 @@ app/
 │   └── queue.py             # Redis connection pool
 ├── services/
 │   ├── llm.py               # OpenAI normalization + spec generation
-│   ├── registry.py          # vendor schema registry (spec lookup + apply)
-│   └── state_manager.py     # canonical entity persistence
+│   └── registry.py          # vendor schema fingerprinting + spec application
 ├── workers/tasks.py         # arq worker — registry-first, LLM fallback
+├── utils.py                 # shared utilities (timestamp parsing etc.)
 └── config.py                # Pydantic settings
-migrations/versions/         # Alembic migration history
-tests/                       # pytest — no infrastructure required
+tests/                       # pytest — requires PostgreSQL
 ```
 
 ---
@@ -305,14 +305,12 @@ pytest tests/test_ingestion.py   # single file
 pytest tests/integration/        # integration tests only (also needs Redis)
 ```
 
-Unit tests mock Redis. Integration tests need both:
+Unit tests mock Redis and the LLM. Integration tests require both PostgreSQL and Redis:
 
 ```bash
 docker compose up postgres redis -d
 pytest tests/integration/
 ```
-
-Tests use in-memory SQLite and a mock Redis — no infrastructure needed.
 
 ---
 
@@ -333,11 +331,81 @@ Tests use in-memory SQLite and a mock Redis — no infrastructure needed.
 
 **Async ingestion:** LLM calls take 1-3s. Decoupling ingestion from processing keeps webhook ACKs under 200ms and makes the two independently scalable and fault-tolerant.
 
-**Vendor schema registry:** The LLM generates a reusable extraction spec on the first event from each vendor schema. All subsequent events from that vendor are processed deterministically — zero LLM calls. The LLM cost is a one-time onboarding cost per vendor, not a per-event cost.
+**Vendor schema registry:** Every vendor sends payloads in a fixed structure — the same field names, the same nesting, event after event. The first time a new payload shape is seen, the worker calls the LLM twice: once to normalize the event, once to generate a reusable `ExtractionSpec`. The spec is a JSON document that encodes exactly how to extract every field from that vendor's payload using dot-notation paths and a keyword-to-state map:
+
+```json
+{
+  "entity_type": "SHIPMENT",
+  "vendor_value": "MAERSK",
+  "state_text_path": "milestone",
+  "state_map": {
+    "loaded onboard": "IN_TRANSIT",
+    "released to shipper": "PICKED_UP",
+    "cargo released": "DELIVERED"
+  },
+  "event_time_path": "milestone_at",
+  "external_id_path": "transport_doc.number",
+  "container_id_path": "container"
+}
+```
+
+The spec is keyed by a **schema fingerprint** — a 16-character hash of the sorted top-level payload keys. On every subsequent event, the worker computes the fingerprint, looks up the spec in `vendor_schemas`, and applies it deterministically with no LLM call. Field extraction is a dot-notation path walk; state mapping is a case-insensitive substring match.
+
+If the spec lookup misses (new vendor) or the state keyword isn't in the map (new event type from a known vendor), the worker falls back to the LLM and the spec is updated. The LLM cost is a one-time onboarding cost per vendor schema shape, not a per-event cost.
+
+**Example — Maersk, first event ever:**
+
+```json
+{
+  "carrier_scac": "MAEU",
+  "event_msg_id": "MAEU-EVT-2026-04-22-0001",
+  "transport_doc": { "type": "MBL", "number": "MAEU240498712" },
+  "container": "MSKU7748112",
+  "milestone": "Loaded onboard and sailed",
+  "milestone_at": "2026-04-21T22:47:00+08:00"
+}
+```
+
+1. Fingerprint computed from sorted keys: `carrier_scac, container, event_msg_id, milestone, milestone_at, transport_doc` → `"a3f1c9e2b4d07f12"`
+2. `vendor_schemas` lookup: **miss** — no spec stored yet
+3. LLM call 1 — `normalize_event`: classifies as `SHIPMENT`, extracts `external_id=MAEU240498712`, `state=IN_TRANSIT`, `event_time=2026-04-21T22:47:00+08:00`
+4. LLM call 2 — `generate_vendor_spec`: produces and stores the spec above
+5. Shipment row inserted, `raw_events.status` → `completed`
+6. **2 LLM calls used**
+
+**Same vendor, next event (different milestone, same schema shape):**
+
+```json
+{
+  "carrier_scac": "MAEU",
+  "event_msg_id": "MAEU-EVT-2026-04-28-0099",
+  "transport_doc": { "type": "MBL", "number": "MAEU240498712" },
+  "container": "MSKU7748112",
+  "milestone": "Cargo released to consignee",
+  "milestone_at": "2026-04-28T09:15:00+08:00"
+}
+```
+
+1. Same top-level keys → same fingerprint `"a3f1c9e2b4d07f12"`
+2. `vendor_schemas` lookup: **hit** — spec returned
+3. `apply_spec`: resolves `milestone` → `"Cargo released to consignee"`, matches `"cargo released"` in `state_map` → `DELIVERED`; resolves `transport_doc.number` → `MAEU240498712`; resolves `milestone_at` → timestamp
+4. Shipment row inserted, `raw_events.status` → `completed`
+5. **0 LLM calls used**
 
 **Commit before enqueue:** The raw event is committed to the DB before the job is pushed to Redis. This prevents the worker from racing an uncommitted row. Events stuck in `pending` (Redis down at enqueue time) are recoverable by re-enqueueing from the DB.
 
-**Append-only canonical tables:** Every normalized event is a new row. Current entity state is derived by ordering records by `event_time DESC` — out-of-order arrivals are handled automatically without any special logic.
+**Append-only canonical tables and out-of-order handling:** Vendors frequently deliver events out of chronological order — a `DELIVERED` update can arrive before the `PICKED_UP` event that preceded it. Rather than trying to detect and reorder events on write, every normalized event is appended as a new row. Current entity state is derived at read time by ordering the full event history by `event_time DESC` and taking the top row — the vendor-reported timestamp, not our ingestion time.
+
+Example — Maersk shipment `MAEU240498712`:
+
+| Arrival order | `event_time` (vendor) | `state` | `created_at` (us) |
+|---|---|---|---|
+| 1st to arrive | 2026-04-21T22:47:00+08:00 | IN_TRANSIT | 2026-04-22T10:01:00Z |
+| 2nd to arrive | 2026-04-19T11:15:00+08:00 | PICKED_UP | 2026-04-22T10:05:00Z |
+
+Both rows are stored. `ORDER BY event_time DESC LIMIT 1` returns `IN_TRANSIT` (April 21) — the late-arriving `PICKED_UP` (April 19) is preserved in history but never becomes the current state. No special reordering logic, no state machine, no conflict resolution — the data model handles it naturally.
+
+**Tolerant timestamp parsing:** Vendor timestamps arrive in inconsistent formats (`ISO 8601`, local time strings like `"28/04/2026 09:42 WIB"`, etc.). A `parse_event_time` utility tries `fromisoformat` first and falls back to `dateutil.parse` to handle non-standard formats gracefully.
 
 **Raw payload persistence:** Every webhook is stored exactly as received. This enables replay for debugging, prompt iteration, and backfills when normalization logic changes.
 
@@ -345,6 +413,37 @@ Tests use in-memory SQLite and a mock Redis — no infrastructure needed.
 
 ---
 
-## License
+## Production roadmap
 
-MIT
+What would need to happen before this runs in production at scale.
+
+**Reliability**
+- Retry with exponential backoff on LLM failures — currently a failed LLM call marks the event `failed` immediately; arq supports configurable retry counts and backoff
+- Dead-letter queue for events that exhaust retries, with alerting
+- Re-enqueue job for events stuck in `pending` beyond a threshold (worker crashed before dequeuing)
+- Idempotency on the worker: guard against double-processing if arq re-runs a job that already completed
+
+**Vendor schema registry**
+- Upsert spec on state map miss — when a known vendor sends a new event type, the spec should be updated rather than falling back to the LLM forever
+- Spec versioning — if the LLM regenerates a spec (e.g. vendor schema changed), keep history so old events can be replayed correctly
+- Manual spec override — allow ops to correct a bad LLM-generated spec without touching the database directly
+
+**Observability**
+- Structured metrics: LLM call rate, registry hit/miss ratio, event processing latency, failure rate per vendor
+- Alerting on sustained `failed` event rate or registry miss rate spikes (may indicate a vendor schema change)
+- Distributed tracing across API → Redis → worker for end-to-end latency visibility
+
+**Security**
+- Webhook signature verification per vendor (HMAC, RSA) — currently any caller can POST to `/webhooks`
+- Rate limiting per vendor to prevent abuse
+- Secrets management (OpenAI key, DB credentials) via Vault or cloud secret manager rather than env vars
+
+**Scalability**
+- Horizontal worker scaling — arq supports multiple worker processes; `max_jobs` per worker is already configurable
+- Read replicas for query-heavy workloads once shipment/invoice read APIs are added
+- Partitioning `shipments` and `invoices` by vendor or time range at high event volumes
+
+**Operations**
+- Alembic migrations run in CI before deployment, not at container startup
+- Blue/green or rolling deploys — the current `entrypoint.sh` migration approach blocks all instances during deploy
+- Backfill tooling — replay raw events through updated normalization logic when prompt or spec changes

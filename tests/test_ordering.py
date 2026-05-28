@@ -1,9 +1,14 @@
-import uuid
 from datetime import datetime
 
 import pytest
 
-from app.db.queries import get_current_invoice_state, get_current_shipment_state, insert_invoice, insert_shipment
+from app.db.queries import (
+    get_current_invoice_state,
+    get_current_shipment_state,
+    insert_invoice,
+    insert_raw_event,
+    insert_shipment,
+)
 from app.services.llm import InvoiceState, ShipmentState
 
 
@@ -12,7 +17,8 @@ async def test_shipment_out_of_order_preservation(db_session):
     """Verifies that late-arriving stale updates are stored, but do not regress the active state projection."""
     vendor = "MAERSK"
     external_id = "SH-990011"
-    raw_payload_id = uuid.uuid4()
+    raw_event = await insert_raw_event(db_session, {"test": True}, "hash_ship_1", None)
+    await db_session.commit()
 
     # 1. Chronologically LATEST event arrives FIRST: DELIVERED at 12:00
     await insert_shipment(
@@ -21,9 +27,10 @@ async def test_shipment_out_of_order_preservation(db_session):
         vendor=vendor,
         state=ShipmentState.DELIVERED.value,
         event_time=datetime.fromisoformat("2026-05-27T12:00:00+00:00"),
-        raw_payload_id=raw_payload_id,
+        raw_payload_id=raw_event.id,
         container_id="MSKU112233",
     )
+    await db_session.commit()
 
     current = await get_current_shipment_state(db_session, vendor, external_id)
     assert current is not None
@@ -36,9 +43,10 @@ async def test_shipment_out_of_order_preservation(db_session):
         vendor=vendor,
         state=ShipmentState.IN_TRANSIT.value,
         event_time=datetime.fromisoformat("2026-05-27T10:00:00+00:00"),
-        raw_payload_id=raw_payload_id,
+        raw_payload_id=raw_event.id,
         container_id="MSKU112233",
     )
+    await db_session.commit()
 
     # 3. Late arrival stored historically, but current state is STILL DELIVERED
     current_after = await get_current_shipment_state(db_session, vendor, external_id)
@@ -51,7 +59,8 @@ async def test_invoice_out_of_order_preservation(db_session):
     """Verifies that late-arriving stale invoice updates do not regress current active status."""
     vendor = "GlobalFreightPay"
     invoice_number = "INV-776655"
-    raw_payload_id = uuid.uuid4()
+    raw_event = await insert_raw_event(db_session, {"test": True}, "hash_inv_1", None)
+    await db_session.commit()
 
     # 1. Chronologically LATEST event arrives FIRST: PAID at 15:00
     await insert_invoice(
@@ -62,8 +71,9 @@ async def test_invoice_out_of_order_preservation(db_session):
         currency="USD",
         amount=5000.00,
         event_time=datetime.fromisoformat("2026-05-27T15:00:00+00:00"),
-        raw_payload_id=raw_payload_id,
+        raw_payload_id=raw_event.id,
     )
+    await db_session.commit()
 
     current = await get_current_invoice_state(db_session, vendor, invoice_number)
     assert current is not None
@@ -78,8 +88,9 @@ async def test_invoice_out_of_order_preservation(db_session):
         currency="USD",
         amount=5000.00,
         event_time=datetime.fromisoformat("2026-05-27T14:00:00+00:00"),
-        raw_payload_id=raw_payload_id,
+        raw_payload_id=raw_event.id,
     )
+    await db_session.commit()
 
     # 3. Current active state remains PAID
     current_after = await get_current_invoice_state(db_session, vendor, invoice_number)

@@ -5,10 +5,7 @@ These tests require real PostgreSQL and Redis — run `docker compose up postgre
 They are skipped automatically if the database is unreachable.
 """
 
-import asyncio
-
 import pytest
-import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -18,16 +15,6 @@ from app.core.queue import get_redis
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
-
-# Force LLM mock — integration tests should not make real OpenAI calls
-settings.OPENAI_API_KEY = None
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest.fixture(scope="session")
@@ -40,7 +27,6 @@ async def integration_engine():
     except Exception:
         pytest.skip("PostgreSQL not reachable — skipping integration tests")
 
-    # Ensure schema is up to date
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
